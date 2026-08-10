@@ -14,31 +14,6 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from google.colab import userdata
 DB_NAME = "music_memory.db"
 
-
-
-def play_on_youtube(query):
-    url = "https://www.youtube.com/results?search_query=" + quote(query)
-
-    print("\n[Player] YouTube link:")
-    print(url)
-
-    from IPython.display import display, HTML
-
-    display(HTML(
-        f'''
-        <a href="{url}" target="_blank">
-            <button style="
-                padding:10px 20px;
-                font-size:16px;
-                cursor:pointer;
-            ">
-                ▶ Play on YouTube
-            </button>
-        </a>
-        '''
-    ))
-
-
 # ==========================================
 
 # 1. LLM INITIALIZATION
@@ -80,6 +55,13 @@ class MusicState(TypedDict):
     selected_song: Optional[str]
     selected_artist: Optional[str]
     feedback: Optional[str]
+    session_active: bool
+    session_id: Optional[str]
+
+    current_genre: Optional[str]
+    current_direction: Optional[str]
+
+    change_requested: bool
 
     next_step: Optional[str]
 
@@ -139,18 +121,19 @@ initialize_music_memory()
 
 def music_player_node(state: MusicState):
 
-    print("\n[Player] Opening music...")
+    print("\n[Player] Preparing music...")
 
     recommendation = state["recommendation"]
-
     search_query = recommendation["search_query"]
 
-    print(f"Searching YouTube for: {search_query}")
+    url = "https://www.youtube.com/results?search_query=" + quote(search_query)
 
-    play_on_youtube(search_query)
+    print(f"Search URL generated:")
+    print(url)
 
     return {
         "selected_song": search_query,
+        "selected_artist": None,
         "next_step": "feedback"
     }
 def record_music_feedback(
@@ -205,34 +188,88 @@ def user_input_node(state: MusicState):
 def feedback_node(state: MusicState):
 
     feedback = input(
-        "\nFeedback (like / skip / dislike / okay): "
+        "\nFeedback [esc = change | exit = end | Enter = continue]: "
     ).strip().lower()
 
+    if feedback == "":
+        return {
+            "feedback": None,
+            "change_requested": False,
+            "next_step": "player"
+        }
+
+    if feedback == "esc":
+        return {
+            "feedback": "change",
+            "change_requested": True,
+            "next_step": "recommend"
+        }
+
+    if feedback == "exit":
+        return {
+            "feedback": "exit",
+            "change_requested": False,
+            "next_step": "exit"
+        }
+
+    # Treat any other text as actual feedback.
     return {
         "feedback": feedback,
-        "next_step": "update_memory"
+        "change_requested": False,
+        "next_step": "player"
     }
 
 
 def update_memory_node(state: MusicState):
 
-    feedback = state["feedback"]
+    feedback = state.get("feedback", "continue")
 
-    if feedback not in ["like", "skip", "dislike", "okay"]:
-        feedback = "okay"
-    record_music_feedback(
-      song=state.get("selected_song", "unknown"),
-      artist=state.get("selected_artist", "unknown"),
-      mood=state.get("mood", "unknown"),
-      activity=state.get("activity", "unknown"),
-      action=feedback
-)
+    if feedback == "exit":
+        print("[Session] Ending music session.")
 
-    print("[Memory] Preference updated.")
+        return {
+            "session_active": False,
+            "next_step": "exit"
+        }
+
+    if feedback == "change":
+        print("[Session] User requested a new musical direction.")
+
+        return {
+            "change_requested": True,
+            "next_step": "recommend"
+        }
+
+    # Normal feedback
+    if feedback not in ["like", "okay", "continue"]:
+        feedback = "continue"
+
+    # Only record actual preference feedback.
+    if feedback in ["like", "okay"]:
+        record_music_feedback(
+            song=state.get("selected_song", "unknown"),
+            artist=state.get("selected_artist", "unknown"),
+            mood=state.get("mood", "unknown"),
+            activity=state.get("activity", "unknown"),
+            action=feedback
+        )
+
+        print(f"[Memory] Recorded feedback: {feedback}")
 
     return {
-    "next_step": "exit"
-        }
+        "change_requested": False,
+        "next_step": "player"
+    }
+
+def route_after_memory(state: MusicState):
+
+    if state.get("next_step") == "exit":
+        return END
+
+    if state.get("next_step") == "recommend":
+        return "recommend"
+
+    return "input"
 
 def mood_analyzer_node(state: MusicState):
 
@@ -328,6 +365,24 @@ Recommend music that fits BOTH:
 Do not assume that a genre is preferred merely because
 it is popular.
 
+CURRENT SESSION DIRECTION:
+
+Current genre:
+{state.get("current_genre", "None")}
+
+Current direction:
+{state.get("current_direction", "None")}
+
+Change requested:
+{state.get("change_requested", False)}
+
+If a change has been requested, deliberately choose a
+different musical direction from the current one.
+
+Do not simply recommend another song from the same
+direction unless the user's history strongly indicates
+that it is appropriate.
+
 Return ONLY valid JSON:
 
 {{
@@ -369,17 +424,15 @@ Return ONLY valid JSON:
     print(result)
 
     return {
-        "recommendation": result,
-        "next_step": "player"
-    }
-
-
-
+    "recommendation": result,
+    "current_genre": result.get("genre"),
+    "current_direction": result.get("reason"),
+    "change_requested": False,
+    "next_step": "player"
+}
 
 # ==========================================
-
 # 5. GRAPH CONSTRUCTION & ROUTING
-
 # ==========================================
 
 workflow = StateGraph(MusicState)
@@ -388,10 +441,10 @@ workflow.add_node("input", user_input_node)
 workflow.add_node("mood", mood_analyzer_node)
 workflow.add_node("recommend", recommendation_node)
 workflow.add_node("player", music_player_node)
-workflow.add_node("feedback", feedback_node)
-workflow.add_node("memory", update_memory_node)
 
 workflow.add_edge(START, "input")
+
+
 def route_after_input(state: MusicState):
 
     if state.get("next_step") == "exit":
@@ -404,38 +457,61 @@ workflow.add_conditional_edges(
     "input",
     route_after_input
 )
+
 workflow.add_edge("mood", "recommend")
 workflow.add_edge("recommend", "player")
-workflow.add_edge("player", "feedback")
-workflow.add_edge("feedback", "memory")
-workflow.add_edge("memory", END)
-app = workflow.compile()
-print("Music assistant compiled and ready.")
 
+# IMPORTANT:
+# The graph stops after preparing the current song.
+# It does NOT wait for feedback.
+workflow.add_edge("player", END)
+
+
+music_graph = workflow.compile()
+
+print("Music LangGraph compiled and ready.")
 
 # ==========================================
-
 # 6. EXECUTION LOOP
-
 # ==========================================
 
-try:
-  app.invoke({
+if __name__ == "__main__":
 
-              "user_input": "",
-              "mood": None,
-              "energy": None,
-              "activity": None,
-              "desired_feeling": None,
-              "music_preferences": {},
-              "recommendation": None,
-              "selected_song": None,
-              "selected_artist": None,
-              "feedback": None,
-              "next_step": None
-          })
+    while True:
 
-except KeyboardInterrupt:
-        print("\nStopped by user.")
-except Exception as e:
-        print(f"\nAn error occurred: {e}")
+        try:
+
+            result = music_graph.invoke({
+                "user_input": "",
+                "mood": None,
+                "energy": None,
+                "activity": None,
+                "desired_feeling": None,
+                "music_preferences": {},
+                "recommendation": None,
+                "selected_song": None,
+                "selected_artist": None,
+                "feedback": None,
+                "change_requested": False,
+                "next_step": None
+            })
+
+            print("\n[Session] Recommendation generated.")
+
+            command = input(
+                "\nCommand [new = new mood | exit = quit]: "
+            ).strip().lower()
+
+            if command == "exit":
+                print("\nMusic assistant stopped.")
+                break
+
+            # Anything else starts another recommendation session
+
+        except KeyboardInterrupt:
+            print("\nStopped by user.")
+            break
+
+        except Exception as e:
+            print(f"\nAn error occurred: {e}")
+            break
